@@ -137,7 +137,7 @@ Return Value:
         //
         // The above roles require the NFP radio to be on.
         //
-        if (!NfcCxPowerIsAllowedNfp(fdoContext)) {
+        if (!NfcCxPowerIsAllowedNfp(fdoContext->Power)) {
             TRACE_LINE(LEVEL_ERROR, "NFP radio state is off, client role %!FILE_OBJECT_ROLE! not supported", fileContext->Role);
             status = STATUS_INVALID_DEVICE_STATE;
             goto Done;
@@ -149,7 +149,7 @@ Return Value:
         //
         // The above roles require the SE to be supported and SE radio to be on.
         //
-        if (!NfcCxPowerIsAllowedSE(fdoContext)) {
+        if (!NfcCxPowerIsAllowedSE(fdoContext->Power)) {
             TRACE_LINE(LEVEL_ERROR, "SE radio state is off, client role %!FILE_OBJECT_ROLE! not supported", fileContext->Role);
             status = STATUS_INVALID_DEVICE_STATE;
             goto Done;
@@ -340,10 +340,8 @@ Return Value:
     // If this is a pub/sub, smartcard or vendor test, add a power reference
     //
     if (NfcCxFileObjectIsPubSub(fileContext) ||
-        ROLE_SMARTCARD == fileContext->Role ||
         NFC_CX_DEVICE_MODE_RAW == fdoContext->NfcCxClientGlobal->Config.DeviceMode) {
-        NCI_POWER_POLICY powerPol = {FALSE};
-        status = NfcCxPowerSetPolicy(NfcCxFileObjectGetFdoContext(fileContext), fileContext, &powerPol);
+        status = NfcCxPowerSetPolicy(NfcCxFileObjectGetFdoContext(fileContext)->Power, fileContext, /*CanPowerDown*/ FALSE);
         if (!NT_SUCCESS(status)) {
             TRACE_LINE(LEVEL_ERROR, "Failed to add a power policy reference, %!STATUS!", status);
             goto Done;
@@ -568,7 +566,7 @@ Return Value:
     //
     // Cleanup any left over power references from this file object
     //
-    (VOID)NfcCxPowerCleanupFilePolicyReferences(fdoContext,
+    (VOID)NfcCxPowerCleanupFilePolicyReferences(fdoContext->Power,
                                                 fileContext);
 
     TRACE_FUNCTION_EXIT(LEVEL_VERBOSE);
@@ -922,7 +920,6 @@ Return Value:
 --*/
 {
     NTSTATUS status = STATUS_SUCCESS;
-    NCI_POWER_POLICY powerPolicy = {0};
 
     TRACE_FUNCTION_ENTRY(LEVEL_VERBOSE);
 
@@ -957,10 +954,9 @@ Return Value:
     //
     // Remove the power reference
     //
-    powerPolicy.CanPowerDown = TRUE;
-    status = NfcCxPowerSetPolicy(NfcCxFileObjectGetFdoContext(FileContext),
+    status = NfcCxPowerSetPolicy(NfcCxFileObjectGetFdoContext(FileContext)->Power,
                                 FileContext,
-                                &powerPolicy);
+                                TRUE); // CanPowerDown
     if (!NT_SUCCESS(status)) {
         TRACE_LINE(LEVEL_ERROR, "Failed to set the power policy, %!STATUS!", status);
         goto Done;
@@ -994,7 +990,6 @@ Return Value:
 --*/
 {
     NTSTATUS status = STATUS_SUCCESS;
-    NCI_POWER_POLICY powerPolicy = {0};
 
     TRACE_FUNCTION_ENTRY(LEVEL_VERBOSE);
 
@@ -1029,10 +1024,9 @@ Return Value:
     //
     // Add the power reference
     //
-    powerPolicy.CanPowerDown = FALSE;
-    status = NfcCxPowerSetPolicy(NfcCxFileObjectGetFdoContext(FileContext),
+    status = NfcCxPowerSetPolicy(NfcCxFileObjectGetFdoContext(FileContext)->Power,
                                 FileContext,
-                                &powerPolicy);
+                                FALSE); // CanPowerDown
     if (!NT_SUCCESS(status)) {
         TRACE_LINE(LEVEL_ERROR, "Failed to set the power policy, %!STATUS!", status);
         goto Done;

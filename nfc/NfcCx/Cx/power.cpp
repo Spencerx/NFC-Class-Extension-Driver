@@ -20,9 +20,129 @@ Environment:
 
 #include "power.tmh"
 
+static const LONGLONG c_DefaultRFUpdateWaitTime = WDF_REL_TIMEOUT_IN_SEC(1);
+
+static bool IsPowerRFManagementEnabled(_In_ PNFCCX_FDO_CONTEXT FdoContext)
+{
+    // We only manage RF radio when device is in NCI mode.
+    return NFC_CX_DEVICE_MODE_NCI == FdoContext->NfcCxClientGlobal->Config.DeviceMode;
+}
+
 NTSTATUS
-NfcCxPowerFdoInitialize(
-    _In_ PNFCCX_FDO_CONTEXT FdoContext
+NfcCxPowerCreate(
+    _In_ PNFCCX_FDO_CONTEXT FdoContext,
+    _Outptr_ PNFCCX_POWER_MANAGER* PPPowerManager
+    )
+/*++
+
+Routine Description:
+
+   Creates a power manager object. (Called when device is initializing for the first time.)
+
+Arguments:
+
+    FdoContext - Pointer to the FDO Context
+    PPPowerManager - Returns a pointer to the new power manager object
+
+Return Value:
+
+    NTSTATUS
+
+--*/
+{
+    NTSTATUS status = STATUS_SUCCESS;
+
+    TRACE_FUNCTION_ENTRY(LEVEL_VERBOSE);
+
+    PNFCCX_POWER_MANAGER powerManager = (PNFCCX_POWER_MANAGER)malloc(sizeof(NFCCX_POWER_MANAGER));
+    if (powerManager == nullptr)
+    {
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        TRACE_LINE(LEVEL_ERROR, "Failed to allocate the power manager, %!STATUS!", status);
+        goto Done;
+    }
+
+    *powerManager = {};
+    powerManager->FdoContext = FdoContext;
+
+    if (IsPowerRFManagementEnabled(FdoContext))
+    {
+        // Check the currently required power state
+        powerManager->NfpRadioState = (!FdoContext->NfpPowerOffPolicyOverride && !FdoContext->NfpPowerOffSystemOverride);
+        powerManager->SERadioState = (!FdoContext->SEPowerOffPolicyOverride && !FdoContext->SEPowerOffSystemOverride);
+    }
+
+    WDF_OBJECT_ATTRIBUTES objectAttrib;
+    WDF_OBJECT_ATTRIBUTES_INIT(&objectAttrib);
+    objectAttrib.ParentObject = FdoContext->Device;
+
+    status = WdfWaitLockCreate(&objectAttrib, &powerManager->WaitLock);
+    if (!NT_SUCCESS(status))
+    {
+        TRACE_LINE(LEVEL_ERROR, "Failed to create the WaitLock, %!STATUS!", status);
+        goto Done;
+    }
+
+    WDF_TIMER_CONFIG timerConfig;
+    WDF_TIMER_CONFIG_INIT(&timerConfig, NfcCxPowerUpdateRFPollingStateWorker);
+    timerConfig.AutomaticSerialization = false;
+
+    WDF_OBJECT_ATTRIBUTES timerAttib;
+    WDF_OBJECT_ATTRIBUTES_INIT(&timerAttib);
+    timerAttib.ParentObject = FdoContext->Device;
+
+    status = WdfTimerCreate(&timerConfig, &timerAttib, &powerManager->UpdateRFStateTimer);
+    if (!NT_SUCCESS(status))
+    {
+        TRACE_LINE(LEVEL_ERROR, "Failed to create threadppol work for RF update. %!STATUS!", status);
+        goto Done;
+    }
+
+
+    *PPPowerManager = powerManager;
+
+Done:
+    TRACE_FUNCTION_EXIT_NTSTATUS(LEVEL_VERBOSE, status);
+    return status;
+}
+
+VOID
+NfcCxPowerDestroy(
+    _In_ PNFCCX_POWER_MANAGER PowerManager
+    )
+/*++
+
+Routine Description:
+
+   Called when device is shutting down.
+
+Arguments:
+
+    PowerManager - Pointer to the Power Manager
+
+Return Value:
+
+    NTSTATUS
+
+--*/
+{
+    TRACE_FUNCTION_ENTRY(LEVEL_VERBOSE);
+
+    // Ensure all the Update RF State callbacks are finished.
+    if (PowerManager->UpdateRFStateTimer != nullptr)
+    {
+        WdfTimerStop(PowerManager->UpdateRFStateTimer, /*wait*/ TRUE);
+    }
+
+    // Free memory
+    free(PowerManager);
+
+    TRACE_FUNCTION_EXIT(LEVEL_VERBOSE);
+}
+
+NTSTATUS
+NfcCxPowerStart(
+    _In_ PNFCCX_POWER_MANAGER PowerManager
     )
 /*++
 
@@ -32,7 +152,7 @@ Routine Description:
 
 Arguments:
 
-    FdoContext - Pointer to the FDO Context
+    PowerManager - Pointer to the Power Manager
 
 Return Value:
     NTSTATUS
@@ -41,28 +161,56 @@ Return Value:
 {
     NTSTATUS status = STATUS_SUCCESS;
 
-    // Check to see if we have any active interface handles.
-    // If we do, it probably means the system has just awoken from sleep.
-    BOOLEAN shouldDeviceStopIdle = NfcCxPowerShouldDeviceStopIdle(FdoContext);
-    if (shouldDeviceStopIdle)
+    TRACE_FUNCTION_ENTRY(LEVEL_VERBOSE);
+
+    if (IsPowerRFManagementEnabled(PowerManager->FdoContext))
     {
-        status = NfcCxPowerUpdateRFPollingState(FdoContext);
-        if (!NT_SUCCESS(status))
+        // Check to see if we have any active interface handles.
+        // If we do, it probably means the system has just awoken from sleep.
+        BOOLEAN shouldDeviceStopIdle = NfcCxPowerShouldDeviceStopIdle(PowerManager);
+        if (shouldDeviceStopIdle)
         {
-            TRACE_LINE(LEVEL_ERROR, "Failed to update RF discovery state, %!STATUS!", status);
-            goto Done;
+            // Ensure RF radio is turned on.
+            NfcCxPowerUpdateRFPollingState(PowerManager, /*PoweringUpRF*/ TRUE);
         }
     }
 
-Done:
+    TRACE_FUNCTION_EXIT_NTSTATUS(LEVEL_VERBOSE, status);
     return status;
+}
+
+VOID
+NfcCxPowerStop(
+    _In_ PNFCCX_POWER_MANAGER PowerManager
+    )
+/*++
+
+Routine Description:
+
+   Called when device is stopping, either because it is entering D3 or shutting down.
+
+Arguments:
+
+    PowerManager - Pointer to the Power Manager
+
+Return Value:
+
+    VOID
+
+--*/
+{
+    // Ensure all the Update RF State callbacks are finished.
+    if (PowerManager->UpdateRFStateTimer != nullptr)
+    {
+        WdfTimerStop(PowerManager->UpdateRFStateTimer, /*wait*/ TRUE);
+    }
 }
 
 NTSTATUS
 NfcCxPowerSetPolicy(
-    _In_ PNFCCX_FDO_CONTEXT FdoContext,
+    _In_ PNFCCX_POWER_MANAGER PowerManager,
     _In_ PNFCCX_FILE_CONTEXT FileContext,
-    _In_ PNCI_POWER_POLICY PowerPolicy
+    _In_ BOOLEAN CanPowerDown
     )
 /*++
 
@@ -74,9 +222,9 @@ Routine Description:
 
 Arguments:
 
-    FdoContext - Pointer to the FDO Context
+    PowerManager - Pointer to the Power Manager
     FileContext - Pointer to the file object context
-    PowerPolicy - The desired power policy
+    CanPowerDown - True: Add a power reference, False: Release a power reference
 
 Return Value:
     NTSTATUS
@@ -90,10 +238,10 @@ Return Value:
 
     TRACE_FUNCTION_ENTRY(LEVEL_VERBOSE);
 
-    WdfWaitLockAcquire(FdoContext->PowerPolicyWaitLock, NULL);
+    WdfWaitLockAcquire(PowerManager->WaitLock, NULL);
 
     powerPolicyReferences = FileContext->PowerPolicyReferences;
-    if (PowerPolicy->CanPowerDown) {
+    if (CanPowerDown) {
 
         //
         // Releasing a reference that doesn't exist
@@ -101,7 +249,7 @@ Return Value:
         if (0 == powerPolicyReferences) {
             TRACE_LINE(LEVEL_ERROR, "Releasing a reference that was not acquired!");
             status = STATUS_INVALID_DEVICE_REQUEST;
-            WdfWaitLockRelease(FdoContext->PowerPolicyWaitLock);
+            WdfWaitLockRelease(PowerManager->WaitLock);
             goto Done;
         }
 
@@ -130,9 +278,9 @@ Return Value:
                 TraceLoggingKeyword(MICROSOFT_KEYWORD_MEASURES));
 
             status = STATUS_UNSUCCESSFUL;
-            NfcCxDeviceSetFailed(FdoContext->Device);
+            NfcCxDeviceSetFailed(PowerManager->FdoContext->Device);
 
-            WdfWaitLockRelease(FdoContext->PowerPolicyWaitLock);
+            WdfWaitLockRelease(PowerManager->WaitLock);
             goto Done;
         }
 
@@ -141,7 +289,7 @@ Return Value:
 
     if (acquireFdoContextRef) {
         BOOLEAN powerReferenceTaken = FALSE;
-        status = NfcCxPowerAcquireFdoContextReferenceLocked(FdoContext, FileContext, &powerReferenceTaken);
+        status = NfcCxPowerAcquireFdoContextReferenceLocked(PowerManager, FileContext, &powerReferenceTaken);
         if (NT_SUCCESS(status) && !powerReferenceTaken)
         {
             powerPolicyReferences--;
@@ -149,7 +297,7 @@ Return Value:
     }
 
     if (releaseFdoContextRef) {
-        status = NfcCxPowerReleaseFdoContextReferenceLocked(FdoContext, FileContext);
+        status = NfcCxPowerReleaseFdoContextReferenceLocked(PowerManager, FileContext);
     }
 
     if (NT_SUCCESS(status))
@@ -160,10 +308,10 @@ Return Value:
     TRACE_LINE(LEVEL_INFO, "Current Power Policy references [FileObject = %p], [FileReferences = %d], [FdoReferences = %d,%d]",
             FileContext->FileObject,
             FileContext->PowerPolicyReferences,
-            FdoContext->NfpPowerPolicyReferences,
-            FdoContext->SEPowerPolicyReferences);
+            PowerManager->NfpPowerPolicyReferences,
+            PowerManager->SEPowerPolicyReferences);
 
-    WdfWaitLockRelease(FdoContext->PowerPolicyWaitLock);
+    WdfWaitLockRelease(PowerManager->WaitLock);
 
 Done:
 
@@ -172,9 +320,47 @@ Done:
     return status;
 }
 
+NFC_CX_POWER_RF_STATE
+NfcCxPowerGetRfState(
+    _In_ PNFCCX_POWER_MANAGER PowerManager
+    )
+/*++
+
+Routine Description:
+
+   Returns whether or not NFP (Proximity) and/or SE (card emulation) should be enabled by the radio (RF).
+
+Arguments:
+
+    PowerManager - Pointer to the Power Manager
+
+Return Value:
+
+    NFC_CX_POWER_RF_STATE
+
+--*/
+{
+    NFC_CX_POWER_RF_STATE result = NfcCxPowerRfState_Off;
+
+    // Note: The values of all these variables do not provide any guarantees about the state of any other memory within the driver.
+    // Hence no memory fence is required.
+
+    if (PowerManager->NfpRadioState && (PowerManager->NfpPowerPolicyReferences != 0))
+    {
+        result = (NFC_CX_POWER_RF_STATE)(result | NfcCxPowerRfState_NfpEnabled);
+    }
+
+    if (PowerManager->SERadioState && (PowerManager->SEPowerPolicyReferences != 0))
+    {
+        result = (NFC_CX_POWER_RF_STATE)(result | NfcCxPowerRfState_SeEnabled);
+    }
+
+    return result;
+}
+
 BOOLEAN
 NfcCxPowerShouldDeviceStopIdle(
-    _In_ PNFCCX_FDO_CONTEXT FdoContext
+    _In_ PNFCCX_POWER_MANAGER PowerManager
     )
 /*++
 
@@ -185,24 +371,21 @@ Routine Description:
 
 Arguments:
 
-    FdoContext - Pointer to the FDO Context
+    PowerManager - Pointer to the Power Manager
 
 Return Value:
+
     BOOLEAN
 
 --*/
 {
-    // Note: The values of all these variables do not provide any gaurantees about the state of any other memory within the driver.
-    // Hence no memory fence is required.
-    return
-        (FdoContext->SERadioState && (FdoContext->SEPowerPolicyReferences != 0)) ||
-        (FdoContext->NfpRadioState && (FdoContext->NfpPowerPolicyReferences != 0));
+    return NfcCxPowerRfState_Off != NfcCxPowerGetRfState(PowerManager);
 }
 
-_Requires_lock_held_(FdoContext->PowerPolicyWaitLock)
+_Requires_lock_held_(PowerManager->WaitLock)
 NTSTATUS
 NfcCxPowerAcquireFdoContextReferenceLocked(
-    _In_ PNFCCX_FDO_CONTEXT FdoContext,
+    _In_ PNFCCX_POWER_MANAGER PowerManager,
     _In_ PNFCCX_FILE_CONTEXT FileContext,
     _Out_ BOOLEAN* pReferenceTaken
     )
@@ -213,11 +396,11 @@ Routine Description:
    NfcCxPowerAcquireFdoContextReferenceLocked acquires
    an FDO power policy reference.
 
-   Callers of this function must hold the PowerPolicyWaitLock.
+   Callers of this function must hold the Power.WaitLock.
 
 Arguments:
 
-    FdoContext - Pointer to the FDO Context
+    PowerManager - Pointer to the Power Manager
     FileContext - Pointer to the file object context
     pReferenceTaken - Output boolean indicating whether we acquired a power policy reference
 
@@ -234,15 +417,15 @@ Return Value:
     NT_ASSERT(pReferenceTaken != NULL);
 
     *pReferenceTaken = FALSE;
-    if (NFC_CX_DEVICE_MODE_RAW == FdoContext->NfcCxClientGlobal->Config.DeviceMode) {
+    if (NFC_CX_DEVICE_MODE_RAW == PowerManager->FdoContext->NfcCxClientGlobal->Config.DeviceMode) {
         TRACE_LINE(LEVEL_INFO, "Raw device mode. Powering up");
 
-        status = WdfDeviceStopIdle(FdoContext->Device, TRUE);
+        status = WdfDeviceStopIdle(PowerManager->FdoContext->Device, TRUE);
         goto Done;
     }
 
     if (!NfcCxFileObjectIsSEManager(FileContext)) {
-        if (MAX_ULONG == FdoContext->NfpPowerPolicyReferences) {
+        if (MAX_ULONG == PowerManager->NfpPowerPolicyReferences) {
 
             //
             // About to overflow the Policy references
@@ -258,12 +441,12 @@ Return Value:
             goto Done;
         }
 
-        IsInterfacePoweringUp = (0 == FdoContext->NfpPowerPolicyReferences) && FdoContext->NfpRadioState;
-        FdoContext->NfpPowerPolicyReferences++;
+        IsInterfacePoweringUp = (0 == PowerManager->NfpPowerPolicyReferences) && PowerManager->NfpRadioState;
+        PowerManager->NfpPowerPolicyReferences++;
         *pReferenceTaken = TRUE;
 
     } else {
-        if (MAX_ULONG == FdoContext->SEPowerPolicyReferences) {
+        if (MAX_ULONG == PowerManager->SEPowerPolicyReferences) {
 
             //
             // About to overflow the Policy references
@@ -279,19 +462,17 @@ Return Value:
             goto Done;
         }
 
-        IsInterfacePoweringUp = (0 == FdoContext->SEPowerPolicyReferences) && FdoContext->SERadioState;
-        FdoContext->SEPowerPolicyReferences++;
+        IsInterfacePoweringUp = (0 == PowerManager->SEPowerPolicyReferences) && PowerManager->SERadioState;
+        PowerManager->SEPowerPolicyReferences++;
         *pReferenceTaken = TRUE;
     }
 
-    BOOLEAN shouldDeviceStopIdle = NfcCxPowerShouldDeviceStopIdle(FdoContext);
+    BOOLEAN shouldDeviceStopIdle = NfcCxPowerShouldDeviceStopIdle(PowerManager);
 
     if (shouldDeviceStopIdle)
     {
         // Ensure device is powered up.
-        // Note: None of our I/O queues are power managed. Hence 'WaitForD0' is allowed to be TRUE.
-        //   (Though some IOCTL's do call 'WdfDeviceStopIdle' directly.)
-        status = NfcCxPowerDeviceStopIdle(FdoContext, /*WaitForD0*/ TRUE);
+        status = NfcCxPowerDeviceStopIdle(PowerManager);
         if (!NT_SUCCESS(status)) {
             TraceLoggingWrite(
                 g_hNfcCxProvider,
@@ -305,20 +486,13 @@ Return Value:
     // we need to update the RF config. (See, 'NfcCxRFInterfaceGetDiscoveryConfig'.)
     if (IsInterfacePoweringUp)
     {
-        status = NfcCxPowerUpdateRFPollingState(FdoContext);
-        if (!NT_SUCCESS(status)) {
-            TraceLoggingWrite(
-                g_hNfcCxProvider,
-                "NfcCxPowerAcquireFdoContextPoweringUpFailed",
-                TraceLoggingKeyword(MICROSOFT_KEYWORD_MEASURES));
-            goto Done;
-        }
+        NfcCxPowerUpdateRFPollingState(PowerManager, /*PoweringUpRF*/ TRUE);
     }
 
 Done:
     if (!NT_SUCCESS(status))
     {
-        NfcCxDeviceSetFailed(FdoContext->Device);
+        NfcCxDeviceSetFailed(PowerManager->FdoContext->Device);
     }
 
     TRACE_FUNCTION_EXIT_NTSTATUS(LEVEL_VERBOSE, status);
@@ -326,10 +500,10 @@ Done:
     return status;
 }
 
-_Requires_lock_held_(FdoContext->PowerPolicyWaitLock)
+_Requires_lock_held_(PowerManager->WaitLock)
 NTSTATUS
 NfcCxPowerReleaseFdoContextReferenceLocked(
-    _In_ PNFCCX_FDO_CONTEXT FdoContext,
+    _In_ PNFCCX_POWER_MANAGER PowerManager,
     _In_ PNFCCX_FILE_CONTEXT FileContext
     )
 /*++
@@ -339,11 +513,11 @@ Routine Description:
    NfcCxPowerReleaseFdoContextReferenceLocked releases
    an FDO power policy reference.
 
-   Callers of this function must hold the PowerPolicyWaitLock.
+   Callers of this function must hold the Power.WaitLock.
 
 Arguments:
 
-    FdoContext - Pointer to the FDO Context
+    PowerManager - Pointer to the Power Manager
     FileContext - Pointer to the file object context
 
 Return Value:
@@ -356,16 +530,16 @@ Return Value:
 
     TRACE_FUNCTION_ENTRY(LEVEL_VERBOSE);
 
-    if (NFC_CX_DEVICE_MODE_RAW == FdoContext->NfcCxClientGlobal->Config.DeviceMode) {
+    if (NFC_CX_DEVICE_MODE_RAW == PowerManager->FdoContext->NfcCxClientGlobal->Config.DeviceMode) {
         TRACE_LINE(LEVEL_INFO, "Raw device mode. Powering down");
 
-        WdfDeviceResumeIdle(FdoContext->Device);
+        WdfDeviceResumeIdle(PowerManager->FdoContext->Device);
         goto Done;
     }
 
     if (!NfcCxFileObjectIsSEManager(FileContext)) {
 
-        if (0 == FdoContext->NfpPowerPolicyReferences) {
+        if (0 == PowerManager->NfpPowerPolicyReferences) {
 
             //
             // About to underflow the Policy references
@@ -381,11 +555,11 @@ Return Value:
             goto Done;
         }
 
-        FdoContext->NfpPowerPolicyReferences--;
-        IsInterfacePoweringDown = (0 == FdoContext->NfpPowerPolicyReferences) && FdoContext->NfpRadioState;
+        PowerManager->NfpPowerPolicyReferences--;
+        IsInterfacePoweringDown = (0 == PowerManager->NfpPowerPolicyReferences) && PowerManager->NfpRadioState;
     } else {
 
-        if (0 == FdoContext->SEPowerPolicyReferences) {
+        if (0 == PowerManager->SEPowerPolicyReferences) {
 
             //
             // About to underflow the Policy references
@@ -401,38 +575,29 @@ Return Value:
             goto Done;
         }
 
-        FdoContext->SEPowerPolicyReferences--;
-        IsInterfacePoweringDown = (0 == FdoContext->SEPowerPolicyReferences) && FdoContext->SERadioState;
+        PowerManager->SEPowerPolicyReferences--;
+        IsInterfacePoweringDown = (0 == PowerManager->SEPowerPolicyReferences) && PowerManager->SERadioState;
     }
 
     // NFP(/SC) and SE can be enabled and disabled separately. So if either of them just got lost their last power reference,
     // we need to update the RF config. (See, 'NfcCxRFInterfaceGetDiscoveryConfig'.)
     if (IsInterfacePoweringDown)
     {
-        status = NfcCxPowerUpdateRFPollingState(FdoContext);
-        if (!NT_SUCCESS(status))
-        {
-            TraceLoggingWrite(
-                g_hNfcCxProvider,
-                "NfcCxPowerReleaseFdoContextPoweringDownFailed",
-                TraceLoggingKeyword(MICROSOFT_KEYWORD_MEASURES));
-
-            goto Done;
-        }
+        NfcCxPowerUpdateRFPollingState(PowerManager, /*PoweringUpRF*/ FALSE);
     }
 
-    BOOLEAN shouldDeviceStopIdle = NfcCxPowerShouldDeviceStopIdle(FdoContext);
+    BOOLEAN shouldDeviceStopIdle = NfcCxPowerShouldDeviceStopIdle(PowerManager);
 
     if (!shouldDeviceStopIdle)
     {
         // Allow device to power down.
-        NfcCxPowerDeviceResumeIdle(FdoContext);
+        NfcCxPowerDeviceResumeIdle(PowerManager);
     }
 
 Done:
     if (!NT_SUCCESS(status))
     {
-        NfcCxDeviceSetFailed(FdoContext->Device);
+        NfcCxDeviceSetFailed(PowerManager->FdoContext->Device);
     }
 
     TRACE_FUNCTION_EXIT_NTSTATUS(LEVEL_VERBOSE, status);
@@ -440,11 +605,10 @@ Done:
     return status;
 }
 
-_Requires_lock_held_(FdoContext->PowerPolicyWaitLock)
+_Requires_lock_held_(PowerManager->WaitLock)
 NTSTATUS
 NfcCxPowerDeviceStopIdle(
-    _In_ PNFCCX_FDO_CONTEXT FdoContext,
-    _In_ BOOLEAN WaitForD0
+    _In_ PNFCCX_POWER_MANAGER PowerManager
     )
 /*++
 
@@ -454,7 +618,7 @@ Routine Description:
 
 Arguments:
 
-    FdoContext - Pointer to the FDO Context
+    PowerManager - Pointer to the Power Manager
     WaitForD0 - Whether or not to wait for the driver to enter the D0 power state before returning.
 
 Return Value:
@@ -463,9 +627,10 @@ Return Value:
 --*/
 {
     NTSTATUS status = STATUS_SUCCESS;
+
     TRACE_FUNCTION_ENTRY(LEVEL_VERBOSE);
 
-    if (FdoContext->PowerDeviceStopIdle)
+    if (PowerManager->DeviceStopIdle)
     {
         // Nothing to do.
         TRACE_LINE(LEVEL_VERBOSE, "Device idle timer already stopped.");
@@ -474,7 +639,7 @@ Return Value:
 
     TRACE_LINE(LEVEL_INFO, "Powering up");
 
-    status = WdfDeviceStopIdle(FdoContext->Device, WaitForD0);
+    status = WdfDeviceStopIdle(PowerManager->FdoContext->Device, /*WaitForD0*/ FALSE);
 
     if (!NT_SUCCESS(status))
     {
@@ -482,17 +647,17 @@ Return Value:
         goto Done;
     }
 
-    FdoContext->PowerDeviceStopIdle = TRUE;
+    PowerManager->DeviceStopIdle = TRUE;
 
 Done:
     TRACE_FUNCTION_EXIT_NTSTATUS(LEVEL_VERBOSE, status);
     return status;
 }
 
-_Requires_lock_held_(FdoContext->PowerPolicyWaitLock)
+_Requires_lock_held_(PowerManager->WaitLock)
 void
 NfcCxPowerDeviceResumeIdle(
-    _In_ PNFCCX_FDO_CONTEXT FdoContext
+    _In_ PNFCCX_POWER_MANAGER PowerManager
     )
 /*++
 
@@ -502,7 +667,7 @@ Routine Description:
 
 Arguments:
 
-    FdoContext - Pointer to the FDO Context
+    PowerManager - Pointer to the Power Manager
 
 Return Value:
     NTSTATUS
@@ -511,7 +676,7 @@ Return Value:
 {
     TRACE_FUNCTION_ENTRY(LEVEL_VERBOSE);
 
-    if (!FdoContext->PowerDeviceStopIdle)
+    if (!PowerManager->DeviceStopIdle)
     {
         // Nothing to do.
         TRACE_LINE(LEVEL_VERBOSE, "Device idle timer already resumed.");
@@ -521,15 +686,16 @@ Return Value:
 
     TRACE_LINE(LEVEL_INFO, "Powering down");
 
-    WdfDeviceResumeIdle(FdoContext->Device);
-    FdoContext->PowerDeviceStopIdle = FALSE;
+    WdfDeviceResumeIdle(PowerManager->FdoContext->Device);
+    PowerManager->DeviceStopIdle = FALSE;
 
     TRACE_FUNCTION_EXIT(LEVEL_VERBOSE);
 }
 
-NTSTATUS
+VOID
 NfcCxPowerUpdateRFPollingState(
-    _In_ PNFCCX_FDO_CONTEXT FdoContext
+    _In_ PNFCCX_POWER_MANAGER PowerManager,
+    _In_ BOOLEAN PoweringUpRF
     )
 /*++
 
@@ -543,27 +709,79 @@ Routine Description:
 
 Arguments:
 
-    FdoContext - Pointer to the FDO Context
+    PowerManager - Pointer to the Power Manager
 
 Return Value:
-    NTSTATUS
+
+    VOID
 
 --*/
 {
-    NTSTATUS status = STATUS_SUCCESS;
     TRACE_FUNCTION_ENTRY(LEVEL_VERBOSE);
 
-    // In the DTA and RAW NfcCx driver modes, 'RFInterface' doesn't exist.
-    // (Though for the most part, the Power Manager isn't called during these modes.)
-    if (!FdoContext->RFInterface)
+    if (!IsPowerRFManagementEnabled(PowerManager->FdoContext))
     {
         // Nothing to do.
-        TRACE_LINE(LEVEL_INFO, "'NfcCxPowerUpdateRFPollingState' called but 'FdoContext->RFInterface' doesn't exist.");
+        TRACE_LINE(LEVEL_WARNING, "'NfcCxPowerUpdateRFPollingState' called but not in NCI mode.");
         goto Done;
     }
 
-    status = NfcCxRFInterfaceUpdateDiscoveryState(FdoContext->RFInterface);
-    if (!NT_SUCCESS(status))
+    // Notes:
+    // 1: We may be on the RF/NCI thread here. (For example, the smartcard interface adds/releases power references on the
+    //   RF/NCI thread.) So we can't call directly into NfcCxRF without risking a deadlock. So we must invoke the RF Config Update
+    //   on a threadpool thread instead.
+    // 2: We are using a timer here to prevent us from constantly turning on and off the radio.
+    LONGLONG dueTime = PoweringUpRF ? 0 : c_DefaultRFUpdateWaitTime;
+    WdfTimerStart(PowerManager->UpdateRFStateTimer, dueTime);
+
+Done:
+    TRACE_FUNCTION_EXIT(LEVEL_VERBOSE);
+}
+
+VOID
+NfcCxPowerUpdateRFPollingStateWorker(
+    _In_ WDFTIMER Timer
+    )
+/*++
+
+Routine Description:
+
+   Worker callback for NfcCxPowerUpdateRFPollingState
+
+Arguments:
+
+    Timer - The timer object that triggered this callback
+
+Return Value
+
+    VOID
+--*/
+{
+    NTSTATUS status = STATUS_SUCCESS;
+
+    TRACE_FUNCTION_ENTRY(LEVEL_VERBOSE);
+
+    WDFOBJECT device = WdfTimerGetParentObject(Timer);
+    PNFCCX_FDO_CONTEXT fdoContext = NfcCxFdoGetContext(device);
+    PNFCCX_POWER_MANAGER powerManager = fdoContext->Power;
+
+    WdfWaitLockAcquire(powerManager->WaitLock, NULL);
+
+    NFC_CX_POWER_RF_STATE currentRfState = NfcCxPowerGetRfState(powerManager);
+
+    WdfWaitLockRelease(powerManager->WaitLock);
+
+    status = NfcCxRFInterfaceUpdateDiscoveryState(fdoContext->RFInterface, currentRfState);
+
+    if (status == STATUS_INVALID_DEVICE_STATE)
+    {
+        // If the device has entered D3, then the RF is off and can't be configured. So we will recieve
+        // STATUS_INVALID_DEVICE_STATE. When the device boots back up, RF config will be run then.
+        // So it is safe to ignore this error code.
+        TRACE_LINE(LEVEL_VERBOSE, "'NfcCxRFInterfaceUpdateDiscoveryState' skipped.");
+        status = STATUS_SUCCESS;
+    }
+    else if (!NT_SUCCESS(status))
     {
         TRACE_LINE(LEVEL_ERROR, "'NfcCxRFInterfaceUpdateDiscoveryState' call failed, status=%!STATUS!", status);
         goto Done;
@@ -571,12 +789,15 @@ Return Value:
 
 Done:
     TRACE_FUNCTION_EXIT_NTSTATUS(LEVEL_VERBOSE, status);
-    return status;
+    if (!NT_SUCCESS(status))
+    {
+        NfcCxDeviceSetFailed(fdoContext->Device);
+    }
 }
 
 NTSTATUS
 NfcCxPowerCleanupFilePolicyReferences(
-    _In_ PNFCCX_FDO_CONTEXT FdoContext,
+    _In_ PNFCCX_POWER_MANAGER PowerManager,
     _In_ PNFCCX_FILE_CONTEXT FileContext
     )
 /*++
@@ -588,7 +809,7 @@ Routine Description:
 
 Arguments:
 
-    FdoContext - Pointer to the FDO Context
+    PowerManager - Pointer to the Power Manager
     FileContext - Pointer to the file object context
 
 Return Value:
@@ -600,20 +821,20 @@ Return Value:
 
     TRACE_FUNCTION_ENTRY(LEVEL_VERBOSE);
 
-    WdfWaitLockAcquire(FdoContext->PowerPolicyWaitLock, NULL);
+    WdfWaitLockAcquire(PowerManager->WaitLock, NULL);
 
     if (0 != FileContext->PowerPolicyReferences) {
-        (VOID)NfcCxPowerReleaseFdoContextReferenceLocked(FdoContext, FileContext);
+        (VOID)NfcCxPowerReleaseFdoContextReferenceLocked(PowerManager, FileContext);
     }
     FileContext->PowerPolicyReferences = 0;
 
     TRACE_LINE(LEVEL_INFO, "Current Power Policy references [FileObject = %p], [FileReferences = %d], [FdoReferences = %d,%d]",
             FileContext->FileObject,
             FileContext->PowerPolicyReferences,
-            FdoContext->NfpPowerPolicyReferences,
-            FdoContext->SEPowerPolicyReferences);
+            PowerManager->NfpPowerPolicyReferences,
+            PowerManager->SEPowerPolicyReferences);
 
-    WdfWaitLockRelease(FdoContext->PowerPolicyWaitLock);
+    WdfWaitLockRelease(PowerManager->WaitLock);
 
     TRACE_FUNCTION_EXIT_NTSTATUS(LEVEL_VERBOSE, status);
 
@@ -622,7 +843,7 @@ Return Value:
 
 NTSTATUS
 NfcCxPowerSetRadioState(
-    _In_ PNFCCX_FDO_CONTEXT FdoContext,
+    _In_ PNFCCX_POWER_MANAGER PowerManager,
     _In_ PNFCCX_FILE_CONTEXT FileContext,
     _In_ PNFCRM_SET_RADIO_STATE RadioState
     )
@@ -637,7 +858,7 @@ Routine Description:
 
 Arguments:
 
-    FdoContext - Pointer to the FDO Context
+    PowerManager - Pointer to the Power Manager
     FileContext - Pointer to the file object context
     RadioState - The desired radio state
 
@@ -652,7 +873,9 @@ Return Value:
 
     TRACE_FUNCTION_ENTRY(LEVEL_VERBOSE);
 
-    WdfWaitLockAcquire(FdoContext->PowerPolicyWaitLock, NULL);
+    PNFCCX_FDO_CONTEXT fdoContext = PowerManager->FdoContext;
+
+    WdfWaitLockAcquire(PowerManager->WaitLock, NULL);
 
     //
     // Validate that the caller is not within the app container
@@ -664,20 +887,20 @@ Return Value:
     }
 
     if (RadioState->SystemStateUpdate) {
-        FdoContext->NfpPowerOffSystemOverride = RadioState->MediaRadioOn ? FALSE : TRUE;
+        fdoContext->NfpPowerOffSystemOverride = RadioState->MediaRadioOn ? FALSE : TRUE;
     }
     else {
         //
         // Since the request is for modifying the radio state
         // we override the system state.
         //
-        FdoContext->NfpPowerOffSystemOverride = FALSE;
-        FdoContext->NfpPowerOffPolicyOverride = RadioState->MediaRadioOn ? FALSE : TRUE;
+        fdoContext->NfpPowerOffSystemOverride = FALSE;
+        fdoContext->NfpPowerOffPolicyOverride = RadioState->MediaRadioOn ? FALSE : TRUE;
     }
 
-    desiredRadioState = !FdoContext->NfpPowerOffPolicyOverride && !FdoContext->NfpPowerOffSystemOverride;
+    desiredRadioState = !fdoContext->NfpPowerOffPolicyOverride && !fdoContext->NfpPowerOffSystemOverride;
 
-    if (FdoContext->NfpRadioState == desiredRadioState) {
+    if (PowerManager->NfpRadioState == desiredRadioState) {
         TRACE_LINE(LEVEL_ERROR, "We are already in the requested power state");
         status = STATUS_INVALID_DEVICE_STATE;
         goto Done;
@@ -687,10 +910,10 @@ Return Value:
     // Update the radio state here so that when we update the polling loop
     // configuration of the controller so that the correct states are used
     //
-    currentRadioState = FdoContext->NfpRadioState;
-    FdoContext->NfpRadioState = desiredRadioState;
+    currentRadioState = PowerManager->NfpRadioState;
+    PowerManager->NfpRadioState = desiredRadioState;
 
-    BOOLEAN shouldDeviceStopIdle = NfcCxPowerShouldDeviceStopIdle(FdoContext);
+    BOOLEAN shouldDeviceStopIdle = NfcCxPowerShouldDeviceStopIdle(PowerManager);
 
     TRACE_LINE(LEVEL_INFO, "Current state %d, Desired State %d", 
                                                     currentRadioState,
@@ -699,48 +922,48 @@ Return Value:
         if (shouldDeviceStopIdle)
         {
             // Ensure device is powered up.
-            status = NfcCxPowerDeviceStopIdle(FdoContext, /*WaitForD0*/ TRUE);
+            status = NfcCxPowerDeviceStopIdle(PowerManager);
             if (NT_SUCCESS(status)) {
                 // Ensure RF config is updated.
-                NfcCxPowerUpdateRFPollingState(FdoContext);
+                NfcCxPowerUpdateRFPollingState(PowerManager, /*PoweringUpRF*/ TRUE);
             }
         }
 
         //
         // Start the appropriate modules
         //
-        NfcCxSCInterfaceStart(FdoContext->SCInterface);
-        NfcCxNfpInterfaceStart(FdoContext->NfpInterface);
+        NfcCxSCInterfaceStart(fdoContext->SCInterface);
+        NfcCxNfpInterfaceStart(fdoContext->NfpInterface);
 
     } else {
         //
         // Stop the appropriate modules
         //
-        NfcCxSCInterfaceStop(FdoContext->SCInterface);
-        NfcCxNfpInterfaceStop(FdoContext->NfpInterface);
+        NfcCxSCInterfaceStop(fdoContext->SCInterface);
+        NfcCxNfpInterfaceStop(fdoContext->NfpInterface);
 
         if (!shouldDeviceStopIdle)
         {
             // Ensure RF config is updated.
-            NfcCxPowerUpdateRFPollingState(FdoContext);
+            NfcCxPowerUpdateRFPollingState(PowerManager, /*PoweringUpRF*/ FALSE);
 
             // Allow the device to power down.
-            NfcCxPowerDeviceResumeIdle(FdoContext);
+            NfcCxPowerDeviceResumeIdle(PowerManager);
         }
     }
     
-    TRACE_LINE(LEVEL_INFO, "Current Power State = %!BOOLEAN!", FdoContext->NfpRadioState);
+    TRACE_LINE(LEVEL_INFO, "Current Power State = %!BOOLEAN!", PowerManager->NfpRadioState);
 
 #ifdef EVENT_WRITE
-    EventWritePowerSetRadioState(FdoContext->NfpRadioState);
+    EventWritePowerSetRadioState(PowerManager->NfpRadioState);
 #endif
 
 Done:
     //
     // Persist the data into the registry
     //
-    NfcCxFdoWritePersistedDeviceRegistrySettings(FdoContext);
-    WdfWaitLockRelease(FdoContext->PowerPolicyWaitLock);
+    NfcCxFdoWritePersistedDeviceRegistrySettings(fdoContext);
+    WdfWaitLockRelease(PowerManager->WaitLock);
 
     TRACE_FUNCTION_EXIT_NTSTATUS(LEVEL_VERBOSE, status);
 
@@ -749,7 +972,7 @@ Done:
 
 NTSTATUS
 NfcCxPowerQueryRadioState(
-    _In_ PNFCCX_FDO_CONTEXT FdoContext,
+    _In_ PNFCCX_POWER_MANAGER PowerManager,
     _In_ PNFCCX_FILE_CONTEXT FileContext,
     _Out_ PNFCRM_RADIO_STATE RadioState
     )
@@ -763,7 +986,7 @@ Routine Description:
 
 Arguments:
 
-    FdoContext - Pointer to the FDO Context
+    PowerManager - Pointer to the Power Manager
     FileContext - Pointer to the file object context
     RadioState - A pointer to an NFCRM_RADIO_STATE structure to receive the current radio state
 
@@ -785,9 +1008,9 @@ Return Value:
         goto Done;
     }
 
-    WdfWaitLockAcquire(FdoContext->PowerPolicyWaitLock, NULL);
-    RadioState->MediaRadioOn = (FdoContext->NfpRadioState);
-    WdfWaitLockRelease(FdoContext->PowerPolicyWaitLock);
+    WdfWaitLockAcquire(PowerManager->WaitLock, NULL);
+    RadioState->MediaRadioOn = (PowerManager->NfpRadioState);
+    WdfWaitLockRelease(PowerManager->WaitLock);
 
 Done:
 
@@ -798,7 +1021,7 @@ Done:
 
 BOOLEAN
 NfcCxPowerIsAllowedNfp(
-    _In_ PNFCCX_FDO_CONTEXT FdoContext
+    _In_ PNFCCX_POWER_MANAGER PowerManager
     )
 /*++
 
@@ -808,7 +1031,7 @@ Routine Description:
 
 Arguments:
 
-    FdoContext - Pointer to the FDO Context
+    PowerManager - Pointer to the Power Manager
 
 Return Value:
     TRUE - If the radio policy hasn't been overwriten to OFF
@@ -818,16 +1041,16 @@ Return Value:
 {
     BOOLEAN isAllowed = FALSE;
 
-    WdfWaitLockAcquire(FdoContext->PowerPolicyWaitLock, NULL);
-    isAllowed = FdoContext->NfpRadioState;
-    WdfWaitLockRelease(FdoContext->PowerPolicyWaitLock);
+    WdfWaitLockAcquire(PowerManager->WaitLock, NULL);
+    isAllowed = PowerManager->NfpRadioState;
+    WdfWaitLockRelease(PowerManager->WaitLock);
 
     return isAllowed;
 }
 
 BOOLEAN
 NfcCxPowerIsAllowedSE(
-    _In_ PNFCCX_FDO_CONTEXT FdoContext
+    _In_ PNFCCX_POWER_MANAGER PowerManager
     )
 /*++
 
@@ -837,7 +1060,7 @@ Routine Description:
 
 Arguments:
 
-    FdoContext - Pointer to the FDO Context
+    PowerManager - Pointer to the Power Manager
 
 Return Value:
     TRUE - If the radio policy hasn't been overwriten to OFF
@@ -847,9 +1070,9 @@ Return Value:
 {
     BOOLEAN isAllowed = FALSE;
 
-    WdfWaitLockAcquire(FdoContext->PowerPolicyWaitLock, NULL);
-    isAllowed = FdoContext->SERadioState;
-    WdfWaitLockRelease(FdoContext->PowerPolicyWaitLock);
+    WdfWaitLockAcquire(PowerManager->WaitLock, NULL);
+    isAllowed = PowerManager->SERadioState;
+    WdfWaitLockRelease(PowerManager->WaitLock);
 
     return isAllowed;
 }
@@ -965,7 +1188,7 @@ NfcCxPowerIoDispatch(
 
             pSetRadioState = (PNFCRM_SET_RADIO_STATE)inBuffer;
 
-            status = NfcCxPowerSetRadioState(fdoContext,
+            status = NfcCxPowerSetRadioState(fdoContext->Power,
                                     FileContext,
                                     pSetRadioState);
             if (!NT_SUCCESS(status)) {
@@ -990,7 +1213,7 @@ NfcCxPowerIoDispatch(
 
             pRadioState = (PNFCRM_RADIO_STATE)outBuffer;
 
-            status = NfcCxPowerQueryRadioState(fdoContext,
+            status = NfcCxPowerQueryRadioState(fdoContext->Power,
                                         FileContext,
                                         pRadioState);
             if (!NT_SUCCESS(status)) {
